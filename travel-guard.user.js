@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn OC Travel Guard
 // @namespace    http://tampermonkey.net/
-// @version      2.5
-// @description  Reads live OC timer from Torn sidebar, shows OC vs. round-trip buffer badge, warns on conflict, and reverts automatically when safe.
+// @version      2.6
+// @description  Reads live OC timer from Torn sidebar, shows OC vs. round-trip buffer badge, warns on conflict, and reverts automatically without hanging Firefox.
 // @author       Til Shaedlaer
 // @match        https://www.torn.com/page.php?sid=travel*
 // @match        https://www.torn.com/travelagency.php*
@@ -136,7 +136,6 @@
         return parts.join(' and ');
     }
 
-    // Reads live OC timer from Torn's sidebar (e.g. "OC: 15m 26s" or "Organized Crime: 1h 20m")
     function findSidebarOCMinutes() {
         const sidebarRoots = document.querySelectorAll('#sidebar, [class*="sidebar"], [id*="sidebar"]');
         const roots = sidebarRoots.length > 0 ? Array.from(sidebarRoots) : [document.body];
@@ -178,14 +177,16 @@
 
     function findNearestContextText(button) {
         let current = button.parentElement;
-        while (current && current !== document.body) {
-            const text = current.innerText || current.textContent || '';
+        let depth = 0;
+        while (current && current !== document.body && depth < 12) {
+            const text = current.textContent || '';
             if (text.length > 0 && text.length < 3000 && /reach your destination in/i.test(text)) {
                 return text;
             }
             current = current.parentElement;
+            depth++;
         }
-        return document.body.innerText || '';
+        return '';
     }
 
     function snapshotOriginalButton(btn) {
@@ -195,24 +196,34 @@
     }
 
     function setButtonNormal(btn) {
-        btn.classList.remove('oc-guard-warning-btn');
-        btn.dataset.ocGuardActive = 'false';
-        if (btn.dataset.ocOrigLabel) {
+        const origLabel = btn.dataset.ocOrigLabel || 'Travel';
+        const currentLabel = btn.tagName === 'INPUT' ? btn.value : btn.textContent;
+        if (btn.dataset.ocGuardActive !== 'false' || btn.classList.contains('oc-guard-warning-btn')) {
+            btn.classList.remove('oc-guard-warning-btn');
+            btn.dataset.ocGuardActive = 'false';
+        }
+        if (currentLabel !== origLabel) {
             if (btn.tagName === 'INPUT') {
-                btn.value = btn.dataset.ocOrigLabel;
+                btn.value = origLabel;
             } else {
-                btn.textContent = btn.dataset.ocOrigLabel;
+                btn.textContent = origLabel;
             }
         }
     }
 
     function setButtonWarning(btn) {
-        btn.classList.add('oc-guard-warning-btn');
-        btn.dataset.ocGuardActive = 'true';
-        if (btn.tagName === 'INPUT') {
-            btn.value = '⚠️ WARNING: OC CONFLICT';
-        } else {
-            btn.textContent = '⚠️ WARNING: OC CONFLICT';
+        const warnLabel = '⚠️ WARNING: OC CONFLICT';
+        const currentLabel = btn.tagName === 'INPUT' ? btn.value : btn.textContent;
+        if (btn.dataset.ocGuardActive !== 'true' || !btn.classList.contains('oc-guard-warning-btn')) {
+            btn.classList.add('oc-guard-warning-btn');
+            btn.dataset.ocGuardActive = 'true';
+        }
+        if (currentLabel !== warnLabel) {
+            if (btn.tagName === 'INPUT') {
+                btn.value = warnLabel;
+            } else {
+                btn.textContent = warnLabel;
+            }
         }
     }
 
@@ -221,7 +232,6 @@
         const sidebarMins = findSidebarOCMinutes();
         const warningMins = extractOCStartMinutes(contextText);
 
-        // Prefer live sidebar OC countdown; fall back to warning sentence duration
         const ocStartMins = sidebarMins !== null ? sidebarMins : warningMins;
         const oneWayMins = extractOneWayFlightMinutes(contextText);
         const roundTripMins = oneWayMins !== null ? oneWayMins * 2 : null;
@@ -262,15 +272,21 @@
         const rtStr = formatMinutes(evaluation.roundTripMins);
         const diffMins = evaluation.ocStartMins - evaluation.roundTripMins;
 
+        let nextClass;
+        let nextText;
+
         if (diffMins < 0) {
             const lateStr = formatMinutes(Math.abs(diffMins));
-            badge.className = 'oc-guard-status-badge oc-guard-status-conflict';
-            badge.textContent = `⏱️ OC in ${ocStr} | Round-trip ${rtStr} (${lateStr} late)`;
+            nextClass = 'oc-guard-status-badge oc-guard-status-conflict';
+            nextText = `⏱️ OC in ${ocStr} | Round-trip ${rtStr} (${lateStr} late)`;
         } else {
             const bufferStr = formatMinutes(diffMins);
-            badge.className = 'oc-guard-status-badge oc-guard-status-safe';
-            badge.textContent = `✅ OC in ${ocStr} | Round-trip ${rtStr} (${bufferStr} buffer)`;
+            nextClass = 'oc-guard-status-badge oc-guard-status-safe';
+            nextText = `✅ OC in ${ocStr} | Round-trip ${rtStr} (${bufferStr} buffer)`;
         }
+
+        if (badge.className !== nextClass) badge.className = nextClass;
+        if (badge.textContent !== nextText) badge.textContent = nextText;
     }
 
     function attachInterceptorOnce(travelBtn) {
@@ -332,29 +348,43 @@
         updateStatusBadge(travelBtn, evaluation);
     }
 
-    function scanPage() {
-        const buttons = document.querySelectorAll('button, a, input[type="submit"], [role="button"]');
-        for (const btn of buttons) {
-            if (btn.dataset.ocOrigSaved === 'true') {
-                syncTravelButton(btn);
-                continue;
-            }
-            const label = (btn.textContent || btn.value || '').trim();
-            if (/^travel$/i.test(label) || /^⚠️ WARNING: OC CONFLICT$/i.test(label)) {
-                syncTravelButton(btn);
-            }
-        }
-    }
-
-    const observer = new MutationObserver(() => {
-        scanPage();
-    });
-
-    observer.observe(document.body, {
+    const observerConfig = {
         childList: true,
         subtree: true,
         characterData: true
+    };
+
+    const observer = new MutationObserver(() => {
+        scheduleScan();
     });
 
-    scanPage();
+    let scanTimer = null;
+    function scheduleScan() {
+        if (scanTimer !== null) return;
+        scanTimer = window.setTimeout(() => {
+            scanTimer = null;
+            runScan();
+        }, 150);
+    }
+
+    function runScan() {
+        observer.disconnect();
+        try {
+            const buttons = document.querySelectorAll('button, a, input[type="submit"], [role="button"]');
+            for (const btn of buttons) {
+                if (btn.dataset.ocOrigSaved === 'true') {
+                    syncTravelButton(btn);
+                    continue;
+                }
+                const label = (btn.textContent || btn.value || '').trim();
+                if (/^travel$/i.test(label) || /^⚠️ WARNING: OC CONFLICT$/i.test(label)) {
+                    syncTravelButton(btn);
+                }
+            }
+        } finally {
+            observer.observe(document.body, observerConfig);
+        }
+    }
+
+    runScan();
 })();
