@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Torn OC Travel Guard
+// @name         TS Torn OC Travel Guard
 // @namespace    http://tampermonkey.net/
 // @version      2.6
 // @description  Reads live OC timer from Torn sidebar, shows OC vs. round-trip buffer badge, warns on conflict, and reverts automatically without hanging Firefox.
